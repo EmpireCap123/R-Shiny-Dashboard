@@ -1,176 +1,204 @@
 # R-Shiny-Dashboard
-WITH ctePolicyBinds AS (
-  SELECT
-    PolicyID,
-    MAX(PolicyNumber) AS policyExists
-  FROM pc_policyperiod
-  GROUP BY PolicyID
-),
+prettifyColumns <- function(x) {
+  # Applies Title Case formatting and spacing to a string. Used to convert
+  # camelCase column names into properly-formatted labels for charts, etc.
+  #
+  # Args:
+  #   x: A character string to format.
+  #
+  # Returns:
+  #   A character string in Title Case format.
+  x <- to_upper_camel_case(x)
+  x <- gsub("([[:lower:]])([[:upper:]])", "\\1 \\2", x)
+  return(x)
+}
 
-cteJobUserRoles AS (
-  SELECT
-    jura.JobID,
-    jura.AssignedUserID,
-    ur.NAME AS userRole
-  FROM pc_jobuserroleassign jura
-  JOIN pctl_userrole ur
-    ON ur.ID = jura.Role
-  WHERE jura.Retired = 0
-    AND ur.RETIRED = 0
-),
+getFilterString <- function(filterList, input = NULL) {
+  # Constructs a string of all of our filtration criteria from the filters
+  # section of the menuOptions list.
+  #
+  # Args:
+  #   filterList: The contents of menuOptions$filters for all UI elements
+  #               active in the currently-selected tab.
+  #   input: A list of all reactive values from the server's scope.
+  #
+  # Returns: R code formatted as a string to be parsed and evaluated in the
+  #          server's scope.
+  for(i in names(filterList)) {
+    # If a user has selected "All" in a selectize menu, then we don't want to
+    # filter any of those results, so we remove that filter from our list.
+    if("All" %in% input[[i]]) {
+      filterList[i] <- NULL
+    }
+  }
+  filterString <- paste0("data[", paste(filterList, collapse = " & "), ", ]")
+  return(filterString)
+}
 
-cteVehicles AS (
-  SELECT
-    capp.BranchID AS PolicyPeriodID,
-    capp.ExpirationDate,
-    'Private Passenger' AS vehicleType
-  FROM pcx_ca7privatepassenger capp
-  UNION ALL
-  SELECT
-    cat.BranchID AS PolicyPeriodID,
-    cat.ExpirationDate,
-    'Truck' AS vehicleType
-  FROM pcx_ca7truck cat
-  UNION ALL
-  SELECT
-    capt.BranchID AS PolicyPeriodID,
-    capt.ExpirationDate,
-    'Public Transport' AS vehicleType
-  FROM pcx_ca7publictransport capt
-  UNION ALL
-  SELECT
-    caspt.BranchID AS PolicyPeriodID,
-    caspt.ExpirationDate,
-    'Special Type' AS vehicleType
-  FROM pcx_ca7specialtype caspt
-),
+aggregateStateData <- function(data, lineOfBusiness) {
+  data <- data[data$lineOfBusiness %in% lineOfBusiness, ]
+  data[is.na(data$firstQuotedDate), "activityType"] <- "Submissions"
+  data[!is.na(data$firstQuotedDate), "activityType"] <- "Quotes"
 
-cteVehicleCount AS (
-  SELECT
-    PolicyPeriodID,
-    COUNT(*) AS vehicleCount
-  FROM cteVehicles
-  WHERE ExpirationDate IS NULL
-  GROUP BY PolicyPeriodID
-)
-
-SELECT
-  j.JobNumber                               AS submissionNumber,
-  ptlj.NAME                                 AS submissionType,
-  qt.DESCRIPTION                            AS quoteType,
-  pps.NAME                                  AS submissionStatus,
-  CASE
-    WHEN pp.PolicyNumber IS NULL THEN 'N'
-    ELSE 'Y'
-  END                                       AS boundPolicyIndicator,
-  CAST(j.SubmissionDate AS DATE)            AS submissionDate,
-  DATENAME(weekday, j.SubmissionDate)       AS submissionDayOfWeek,
-  CAST(pp.dateFirstQuoted AS DATE)          AS firstQuotedDate,
-  CAST(pp.RateAsOfDate AS DATE)             AS rateAsOfDate,
-  p.ProductCode                             AS lineOfBusiness,
-  CAST(pp.PeriodStart AS DATE)              AS quotedPolicyEffectiveDate,
-  CAST(pp.PeriodEnd AS DATE)                AS quotedPolicyExpirationDate,
-  pp.TotalPremiumRPT                        AS premiumAmount,
-  jur.DESCRIPTION                           AS baseState,
-  tc.Code                                   AS primaryLocationTerritoryCode,
-  propcen.Centile                           AS propertyCentile,
-  libcen.Centile                            AS liabilityCentile,
-  COALESCE(camt.NAME, 'Not in CA7 Program') AS programDescription,
-  pag.Name                                  AS affinityGroup,
-  a.AccountNumber                           AS accountNumber,
-  uwc.FirstName + ' ' + uwc.LastName        AS underwriterName,
-  crc.FirstName + ' ' + crc.LastName        AS createUserName,
-  agc.FirstName + ' ' + agc.LastName        AS agentName,
-  pc.Description                            AS agencyName,
-  ags.NAME                                  AS agencyState,
-  pc.Code                                   AS agencyCode,
-  ic.Code                                   AS naicsCode,
-  ic.Classification                         AS naicsDescription,
-  cv.vehicleCount,
-  pp.PolicyNumber                           AS policyNumber,
-  pp.PrevInstallmentPlan                    AS billingPlan,
-  CASE
-    WHEN pp.PolicyNumber IS NOT NULL
-     AND ptlj.NAME = 'Submission'
-     AND pps.NAME = 'Bound'
-    THEN CAST(j.UpdateTime AS DATE)
-    ELSE NULL
-  END                                       AS boundDate
-FROM pc_job j
-JOIN cteJobUserRoles uwcjur
-  ON uwcjur.JobID = j.ID
- AND uwcjur.userRole = 'Underwriter'
-JOIN pc_user uwu
-  ON uwu.ID = uwcjur.AssignedUserID
-JOIN pc_contact uwc
-  ON uwc.ID = uwu.ContactID
-JOIN cteJobUserRoles crcjur
-  ON crcjur.JobID = j.ID
- AND crcjur.userRole = 'Creator'
-JOIN pc_user cru
-  ON cru.ID = crcjur.AssignedUserID
-JOIN pc_contact crc
-  ON crc.ID = cru.ContactID
-JOIN cteJobUserRoles agcjur
-  ON agcjur.JobID = j.ID
- AND agcjur.userRole = 'Producer' -- aka Agent
-JOIN pc_user agu
-  ON agu.ID = agcjur.AssignedUserID
-JOIN pc_contact agc
-  ON agc.ID = agu.ContactID
-JOIN pc_policyperiod pp
-  ON pp.JobID = j.ID
-JOIN pc_policy p
-  ON p.ID = pp.PolicyID
-JOIN pc_policyterm pt
-  ON pt.ID = pp.PolicyTermID
-JOIN pc_policyline pl
-  ON pl.BranchID = pp.ID
- AND pl.ExpirationDate IS NULL
-LEFT JOIN pctl_ca7modeltype_ext camt
-  ON camt.ID = pl.CA7Model_Ext
-JOIN pc_account a
-  ON p.AccountID = a.ID
-JOIN pc_producercode pc
-  ON pc.ID = pp.ProducerCodeOfRecordID
-JOIN pc_address aga
-  ON aga.ID = pc.AddressID
-LEFT JOIN pc_affinitygroup pag
-  ON pag.ID = pt.AffinityGroupID
-JOIN pctl_state ags
-  ON ags.ID = aga.State
-JOIN pc_industrycode ic
-  ON ic.ID = pp.IndustryCodeID
-JOIN pctl_industrycodetype ict
-  ON ict.ID = ic.Domain
- AND ict.NAME = 'NAICS'
-JOIN pctl_policyperiodstatus pps
-  ON pps.ID = pp.Status
-JOIN pctl_job ptlj
-  ON ptlj.ID = j.Subtype
-JOIN pctl_quotetype qt
-  ON qt.ID = j.QuoteType
-JOIN pctl_jurisdiction jur
-  ON jur.ID = pp.BaseState
-JOIN pc_policylocation ploc
-  ON ploc.BranchID = pp.ID
- AND ploc.LocationNum = 1
- AND ploc.ExpirationDate IS NULL
-JOIN pc_territorycode tc
-  ON tc.BranchID = ploc.BranchID
- AND tc.PolicyLocation = ploc.FixedID
- AND tc.ExpirationDate IS NULL
-LEFT JOIN cteVehicleCount cv
-  ON cv.PolicyPeriodID = pp.ID
-LEFT JOIN ctePolicyBinds cpb
-  ON cpb.PolicyID = pp.PolicyID
-LEFT JOIN pcx_esescoreprop_ext propcen
-  ON propcen.BranchID = pp.ID
-LEFT JOIN pcx_esescoreliab_ext libcen
-  ON libcen.BranchID = pp.ID
-WHERE p.ProductCode IN ('BP7BusinessOwners', 'CA7CommAuto')
-  AND (
-    (pp.PolicyNumber IS NOT NULL AND ptlj.NAME = 'Submission' AND pps.NAME = 'Bound')
-    OR (pp.PolicyNumber IS NULL AND pp.BranchNumber = 1 AND cpb.policyExists IS NULL)
+  activityData <- aggregate(
+    x = list(activityCount = data$submissionStatus),
+    by = list(
+      baseState = data$baseState,
+      activityType = data$activityType
+    ),
+    FUN = "length"
   )
-ORDER BY submissionNumber;
+  activityData <- dcast(
+    data = activityData,
+    formula = baseState ~ activityType,
+    value.var = "activityCount"
+  )
+
+  activityData[is.na(activityData)] <- 0
+  # All quotes are submissions but not all submissions are quotes
+  activityData$Submissions <- activityData$Quote + activityData$Submission
+
+  activityData <- melt(
+    data = activityData,
+    id.vars = "baseState",
+    variable.name = "activityType",
+    value.name = "activityCount"
+  )
+
+  salesData <- data[data$boundPolicyIndicator == "Y", ]
+  salesData <- aggregate(
+    x = list(activityCount = salesData$boundPolicyIndicator),
+    by = list(baseState = salesData$baseState),
+    FUN = "length"
+  )
+  salesData$activityType <- "Sales"
+
+  # Combine data and filter out states where sales are impossible
+  mergedData <- rbind(activityData, salesData)
+  mergedData <- mergedData[
+    mergedData$baseState %in%
+    mergedData[mergedData$activityType == "Sales", "baseState"],
+  ]
+  mergedData$activityType <- factor(
+    mergedData$activityType,
+    levels = c("Submissions", "Quotes", "Sales")
+  )
+  return(mergedData)
+}
+
+aggregateMonthData <- function(data, lineOfBusiness) {
+  data <- data[data$lineOfBusiness %in% lineOfBusiness, ]
+  data[is.na(data$firstQuotedDate), "activityType"] <- "Submissions"
+  data[!is.na(data$firstQuotedDate), "activityType"] <- "Quotes"
+
+  activityData <- aggregate(
+    x = list(activityCount = data$submissionStatus),
+    by = list(
+      month = month(data$submissionDate, label = TRUE),
+      year = year(data$submissionDate),
+      activityType = data$activityType
+    ),
+    FUN = "length"
+  )
+  activityData <- dcast(
+    data = activityData,
+    formula = month + year ~ activityType,
+    value.var = "activityCount"
+  )
+  activityData[is.na(activityData)] <- 0
+  # All quotes are submissions but not all submissions are quotes
+  activityData$Submissions <- activityData$Quote + activityData$Submission
+
+  activityData <- melt(
+    data = activityData,
+    id.vars = c("month", "year"),
+    variable.name = "activityType",
+    value.name = "activityCount"
+  )
+
+  salesData <- data[data$boundPolicyIndicator == "Y", ]
+  salesData <- aggregate(
+    x = list(activityCount = salesData$boundPolicyIndicator),
+    by = list(
+      month = month(salesData$submissionDate, label = TRUE),
+      year = year(salesData$submissionDate)
+    ),
+    FUN = "length"
+  )
+  salesData$activityType <- "Sales"
+
+  # Combine data
+  mergedData <- rbind(activityData, salesData)
+  mergedData$activityType <- factor(
+    mergedData$activityType,
+    levels = c(
+      "Submissions",
+      "Quotes",
+      "Sales",
+      "Quoted Premium",
+      "Bound Premium"
+    )
+  )
+  mergedData$date <- as.Date(
+    paste(mergedData$month, mergedData$year, "01", sep = "-"),
+    format = "%b-%Y-%d"
+  )
+  return(mergedData)
+}
+
+accordionMenuItem <- function(text, ..., icon = NULL) {
+  # Creates an accordion menu compatible with a Shinydashboard sidebar menu
+  #
+  # Args:
+  #   text: The text to display as the menu label
+  #   icon: An icon() to display alongside the text label.
+  #   ...: An arbitrary number of Shiny UI elements to include within the menu.
+  #
+  # Returns:
+  #   Shiny-compatible HTML object that expands and contracts on click and can
+  #   contain multiple other shiny UI elements.
+  uiList <- list(...)
+  tags$li(
+    tags$a(class = "accordion", href = "#", icon, tags$span(text)),
+    tags$ul(class = "panel", uiList)
+  )
+}
+
+dropdownActionMenu <-
+  function (..., title = NULL, icon = NULL, header = NULL) {
+    # Creates a Shinydashboard compatible drop down menu that can accept UI
+    # elements other than the small number of pre-packaged ones that are native
+    # to Shinydashboard.
+    #
+    # Args:
+    #   ...: An arbitrary number of Shiny UI elements to include within the menu
+    #   title: The text to display as the menu label
+    #   icon: An icon() to display alongside the text label.
+    #   header: An optional header to add to the drop down
+    #
+    # Returns:
+    #   Shiny-compatible HTML object that lives in the top right corner of the
+    #   dashboard, expands and contracts on click and can contain multiple other
+    #   shiny UI elements.
+    items <- list(...)
+    lapply(items, shinydashboard:::tagAssert, type = "li")
+    type <- "notifications"
+    dropdownClass <- paste0("dropdown ", type, "-menu")
+    tags$li(
+      class = dropdownClass,
+      a(
+        href = "#",
+        class = "dropdown-toggle",
+        `data-toggle` = "dropdown",
+        icon,
+        title
+      ),
+      tags$ul(
+        class = "dropdown-menu",
+        if(!is.null(header)) {
+          tags$li(class = "header", header)
+        },
+        tags$li(tags$ul(class = "menu", items))
+      )
+    )
+  }
